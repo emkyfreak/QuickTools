@@ -1,0 +1,55 @@
+# Build results
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+build/
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+# ReSharper
+_ReSharper*/
+*.DotSettings.user
+
+# Build outputs
+*.dll
+*.exe
+*.pdb
+!QuickToolsPlugin.dll
+
+# Rider
+.idea/
+
+# Unity
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+
+# OS generated
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Log files
+*.log
+
+# Package files
+*.zip
+*.rar
+*.7z
+
+# Personal files
+TODO.txt
+NOTES.md
