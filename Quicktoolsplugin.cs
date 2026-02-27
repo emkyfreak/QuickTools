@@ -1,4 +1,5 @@
-﻿using System;
+using System;
+using System.IO;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
@@ -42,8 +43,13 @@ namespace StudioCustomButton
         private Toggle _hideHeadToggle;
         private bool _isViewLocked = false;
         private bool _isHeadHidden = true;
+        private List<Renderer> _hiddenRenderers = new List<Renderer>();
         private Transform _vrCameraOrigin;
         private float _cameraTilt = 0f;
+        private Vector3 _savedCamTargetPos;
+        private Vector3 _savedCamAngle;
+        private Vector3 _savedCamDir;
+        private bool _isCamSaved = false;
 
         // Female Tools State
         private List<ChaControl> _femaleCharacters = new List<ChaControl>();
@@ -67,11 +73,21 @@ namespace StudioCustomButton
         private Text _animGroupDisplay = null;
         private Text _animCategoryDisplay = null;
         private Text _animIDDisplay = null;
+        // Coordinate Card selection state
+        private List<string> _clothingCardPaths = new List<string>();
+        private int _currentCardIndex = -1;
+        private Text _clothingCardDisplay = null;
+        private bool _lockHairAccOnClothingChange = true;
+        private List<string> _coordFolders = new List<string>();
+        private int _currentFolderIndex = 0;
+        private Text _coordFolderDisplay = null;
 
         // Config
+        private ConfigEntry<bool> _extendedOutfitMode;
         private ConfigEntry<string> _customSpawnGroup;
         private ConfigEntry<int> _customSpawnCategory;
         private ConfigEntry<int> _customSpawnItem;
+        private ConfigEntry<string> _customSpawnItems; // Format: name|group|cat|item;name2|group2|cat2|item2
 
         void Awake()
         {
@@ -84,6 +100,14 @@ namespace StudioCustomButton
                 "Category number for custom spawn button");
             _customSpawnItem = Config.Bind("Item Tools", "Custom Spawn Item", 0,
                 "Item number for custom spawn button");
+
+            // Config for extended outfit mode
+            _extendedOutfitMode = Config.Bind("Female Tools", "Extended Outfit Mode", false,
+                "Enable cycling through 0-120 outfits instead of 0-6. Adds +1/-1 and +10/-10 buttons.");
+
+            // Config for custom spawn items (dynamic list)
+            _customSpawnItems = Config.Bind("Item Tools", "Custom Spawn Items List", "",
+                "Format: name|group|cat|item;name2|group2|cat2|item2 (Example: Sphere|0|0|0;Light|3|100|50)");
 
             Logger.LogInfo(PluginName + " v" + Version + " loaded");
         }
@@ -126,7 +150,8 @@ namespace StudioCustomButton
             {
                 "Canvas",
                 "Canvas Main Menu",
-                "StudioScene/Canvas Main Menu"
+                "StudioScene/Canvas Main Menu",
+                "Canvas Object Hierarchy"
             };
 
             foreach (string canvasName in canvasNames)
@@ -143,11 +168,10 @@ namespace StudioCustomButton
                 }
             }
 
-            Canvas[] allCanvases = Resources.FindObjectsOfTypeAll<Canvas>();
+            Canvas[] allCanvases = FindObjectsOfType<Canvas>();
             foreach (Canvas canvas in allCanvases)
             {
                 if (canvas.renderMode == RenderMode.ScreenSpaceOverlay &&
-                    canvas.gameObject.scene.isLoaded &&
                     canvas.gameObject.activeInHierarchy)
                 {
                     Logger.LogInfo("Using Canvas: " + canvas.name);
@@ -169,11 +193,14 @@ namespace StudioCustomButton
             Button button = _mainButton.AddComponent<Button>();
             button.onClick.AddListener(OnMainButtonClicked);
 
+            _mainButton.AddComponent<DragPanel>();
+
             RectTransform rectTransform = _mainButton.GetComponent<RectTransform>();
-            rectTransform.anchorMin = new Vector2(0, 0);
-            rectTransform.anchorMax = new Vector2(0, 0);
-            rectTransform.pivot = new Vector2(0, 0);
-            rectTransform.anchoredPosition = new Vector2(10, 10);
+            // MOVED to avoid transformation window
+            rectTransform.anchorMin = new Vector2(1, 0);
+            rectTransform.anchorMax = new Vector2(1, 0);
+            rectTransform.pivot = new Vector2(1, 0);
+            rectTransform.anchoredPosition = new Vector2(-140, 10);  // 140px from right, 10px from bottom
             rectTransform.sizeDelta = new Vector2(120, 40);
 
             GameObject textObj = new GameObject("Text");
@@ -189,7 +216,7 @@ namespace StudioCustomButton
             RectTransform textRect = textObj.GetComponent<RectTransform>();
             SetupStretchedRectTransform(textRect);
 
-            Logger.LogInfo("Main button created");
+            Logger.LogInfo("Main button created (draggable, top-right)");
         }
 
         private void CreateCustomPanel()
@@ -206,9 +233,8 @@ namespace StudioCustomButton
             panelRect.anchorMax = new Vector2(0.5f, 0.5f);
             panelRect.pivot = new Vector2(0.5f, 0.5f);
             panelRect.anchoredPosition = Vector2.zero;
-            panelRect.sizeDelta = new Vector2(420, 600); // Reduced width from 500 to 420
+            panelRect.sizeDelta = new Vector2(420, 600);
 
-            // Make panel draggable
             AddDraggableComponent(_customPanel);
 
             CreateTitleBar();
@@ -221,65 +247,28 @@ namespace StudioCustomButton
 
         private void AddDraggableComponent(GameObject panel)
         {
-            // Add a custom draggable script
             DragPanel dragScript = panel.AddComponent<DragPanel>();
         }
 
         // Simple drag component for the panel
-        private class DragPanel : UnityEngine.EventSystems.UIBehaviour,
-            UnityEngine.EventSystems.IBeginDragHandler,
-            UnityEngine.EventSystems.IDragHandler
+        private class DragPanel : UnityEngine.EventSystems.UIBehaviour, UnityEngine.EventSystems.IDragHandler
         {
-            private Vector2 _dragOffset;
             private RectTransform _rectTransform;
-            private RectTransform _canvasRect;
+            private Canvas _canvas;
 
             protected override void Awake()
             {
                 base.Awake();
                 _rectTransform = GetComponent<RectTransform>();
-                _canvasRect = _rectTransform.parent as RectTransform;
-            }
-
-            public void OnBeginDrag(UnityEngine.EventSystems.PointerEventData eventData)
-            {
-                Vector2 localPoint;
-                RectTransformUtility.ScreenPointToLocalPointInRectangle(
-                    _rectTransform, eventData.position, eventData.pressEventCamera, out localPoint);
-                _dragOffset = _rectTransform.anchoredPosition - localPoint;
+                _canvas = GetComponentInParent<Canvas>();
             }
 
             public void OnDrag(UnityEngine.EventSystems.PointerEventData eventData)
             {
-                Vector2 localPoint;
-                if (RectTransformUtility.ScreenPointToLocalPointInRectangle(
-                    _rectTransform.parent as RectTransform, eventData.position, eventData.pressEventCamera, out localPoint))
-                {
-                    Vector2 newPos = localPoint + _dragOffset;
-
-                    // Constrain to screen bounds
-                    if (_canvasRect != null)
-                    {
-                        Vector2 canvasSize = _canvasRect.sizeDelta;
-                        Vector2 panelSize = _rectTransform.sizeDelta;
-
-                        // Keep entire panel within canvas bounds
-                        float halfPanelWidth = panelSize.x / 2;
-                        float halfPanelHeight = panelSize.y / 2;
-                        float halfCanvasWidth = canvasSize.x / 2;
-                        float halfCanvasHeight = canvasSize.y / 2;
-
-                        float minX = -halfCanvasWidth + halfPanelWidth;
-                        float maxX = halfCanvasWidth - halfPanelWidth;
-                        float minY = -halfCanvasHeight + halfPanelHeight;
-                        float maxY = halfCanvasHeight - halfPanelHeight;
-
-                        newPos.x = Mathf.Clamp(newPos.x, minX, maxX);
-                        newPos.y = Mathf.Clamp(newPos.y, minY, maxY);
-                    }
-
-                    _rectTransform.anchoredPosition = newPos;
-                }
+                if (_canvas == null) return;
+                // Using eventData.delta divided by the canvas scale factor works perfectly 
+                // regardless of where the anchor/pivot is, preventing it from jumping off-screen!
+                _rectTransform.anchoredPosition += eventData.delta / _canvas.scaleFactor;
             }
         }
 
@@ -447,8 +436,10 @@ namespace StudioCustomButton
             yPos = CreateCyclerButtons(_maleToolsMenu, "Male", yPos, OnMalePrevious, OnMaleNext);
             yPos -= 15;
 
-            // POV Button
+            // POV Buttons
             yPos = CreateActionButton(_maleToolsMenu, "Set POV", yPos, OnSetPOV);
+            yPos -= 5;
+            yPos = CreateActionButton(_maleToolsMenu, "Stop POV (Reset Camera)", yPos, OnStopPOV);
             yPos -= 10;
 
             // Lock View Checkbox
@@ -542,28 +533,53 @@ namespace StudioCustomButton
 
         private void OnSetPOV()
         {
-            if (_selectedMale == null)
+            if (_selectedMale == null) return;
+
+            // Save the studio camera position before snapping into POV
+            var camCtrl = Studio.Studio.Instance.cameraCtrl;
+            if (camCtrl != null && !_isViewLocked && !_isCamSaved)
             {
-                Logger.LogWarning("No male character selected");
-                return;
+                _savedCamTargetPos = camCtrl.targetPos;
+                _savedCamAngle = camCtrl.cameraAngle;
+                _savedCamDir = GetCameraDistance(camCtrl);
+                _isCamSaved = true;
             }
 
-            // Start coroutine to apply POV multiple times (like your TeleportMaleRoutine)
             StartCoroutine(ApplyPOVRoutine());
+        }
+
+        private void OnStopPOV()
+        {
+            // 1. Turn off the locks
+            _isViewLocked = false;
+            if (_lockViewToggle != null) _lockViewToggle.isOn = false;
+
+            // 2. Restore the head
+            if (_selectedMale != null)
+            {
+                OCIChar targetMale = Studio.Studio.Instance.dicObjectCtrl.Values.OfType<OCIChar>()
+                    .FirstOrDefault(x => x.charInfo == _selectedMale);
+                if (targetMale != null) ShowHead(targetMale);
+            }
+
+            // 3. Reset Tilt
+            _cameraTilt = 0f;
+
+            // 4. Restore Studio Camera Position
+            var camCtrl = Studio.Studio.Instance.cameraCtrl;
+            if (camCtrl != null && _isCamSaved)
+            {
+                camCtrl.targetPos = _savedCamTargetPos;
+                camCtrl.cameraAngle = _savedCamAngle;
+                SetCameraDistance(camCtrl, _savedCamDir);
+                _isCamSaved = false;
+            }
+            Logger.LogInfo("POV Stopped and Camera Restored");
         }
 
         private IEnumerator ApplyPOVRoutine()
         {
-            for (int i = 0; i < 5; i++)
-            {
-                ApplyPOV();
-                yield return new WaitForEndOfFrame();
-            }
-        }
-
-        private void ApplyPOV()
-        {
-            // Find the OCIChar for the selected male
+            // Find the OCIChar for the selected male once
             OCIChar targetMale = null;
             foreach (var kvp in Studio.Studio.Instance.dicObjectCtrl)
             {
@@ -575,92 +591,68 @@ namespace StudioCustomButton
                 }
             }
 
-            if (targetMale == null)
-            {
-                Logger.LogWarning("Could not find OCIChar for selected male");
-                return;
-            }
+            if (targetMale == null) yield break;
 
-            Transform headBone = targetMale.charInfo.objHeadBone.transform;
-            Camera mainCam = Camera.main;
-
-            // Check for VR camera first
+            // Look for VR camera once before tracking
             GameObject vrCamObj = GameObject.Find("VRGIN_Camera (origin)");
             _vrCameraOrigin = vrCamObj != null ? vrCamObj.transform : null;
 
+            // Apply camera math for a few frames to ensure it snaps
+            for (int i = 0; i < 5; i++)
+            {
+                ApplyCameraTracking();
+                yield return new WaitForEndOfFrame();
+            }
+
+            // OPTIMIZATION: Only run the heavy mesh purge ONCE at the end of setting POV
+            if (_hideHeadToggle != null && _hideHeadToggle.isOn)
+            {
+                HideHead(targetMale);
+            }
+        }
+
+        private void ApplyCameraTracking()
+        {
+            OCIChar targetMale = null;
+            foreach (var kvp in Studio.Studio.Instance.dicObjectCtrl)
+            {
+                OCIChar chara = kvp.Value as OCIChar;
+                if (chara != null && chara.charInfo == _selectedMale) { targetMale = chara; break; }
+            }
+
+            if (targetMale == null) return;
+
+            Transform headBone = targetMale.charInfo.objHeadBone.transform;
+
             if (_vrCameraOrigin != null)
             {
-                // VR Mode - need to account for eye offset too
-                // In VR, the camera is offset from the origin, similar to desktop
+                // --- VR MODE ---
                 Camera vrCam = _vrCameraOrigin.GetComponentInChildren<Camera>();
-                if (vrCam != null)
-                {
-                    Vector3 eyeOffset = vrCam.transform.position - _vrCameraOrigin.position;
-                    _vrCameraOrigin.position = headBone.position - eyeOffset;
-                    _vrCameraOrigin.rotation = headBone.rotation * Quaternion.Inverse(vrCam.transform.localRotation);
-                    Logger.LogInfo("POV set in VR mode with eye offset");
-                }
-                else
-                {
-                    // Fallback if no camera found
-                    _vrCameraOrigin.position = headBone.position;
-                    _vrCameraOrigin.rotation = headBone.rotation;
-                    Logger.LogInfo("POV set in VR mode (no eye offset)");
-                }
-            }
-            else if (mainCam != null && mainCam.transform.parent != null)
-            {
-                // Desktop Mode - with camera rig (your working code!)
-                Transform rig = mainCam.transform.parent;
-                Vector3 eyeOffset = mainCam.transform.position - rig.position;
-                rig.position = headBone.position - eyeOffset;
-                rig.rotation = headBone.rotation * Quaternion.Inverse(mainCam.transform.localRotation);
-                Logger.LogInfo(string.Format("POV set via camera rig - Pos: {0}, Rot: {1}", headBone.position, headBone.rotation.eulerAngles));
-            }
-            else if (Studio.Studio.Instance.cameraCtrl != null)
-            {
-                // Fallback to Studio camera control
-                Studio.Studio.Instance.cameraCtrl.transform.position = headBone.position;
-                Studio.Studio.Instance.cameraCtrl.transform.rotation = headBone.rotation;
-                Logger.LogInfo(string.Format("POV set via Studio cameraCtrl - Pos: {0}, Rot: {1}", headBone.position, headBone.rotation.eulerAngles));
-            }
+                Quaternion baseRotation = headBone.rotation * Quaternion.Inverse(vrCam.transform.localRotation);
+                Quaternion targetRotation = baseRotation * Quaternion.Euler(_cameraTilt, 0, 0);
 
-            ApplyCameraTilt();
-
-            // Hide head and all head-related accessories if enabled
-            if (!ReferenceEquals(_hideHeadToggle, null) && _hideHeadToggle.isOn)
+                Vector3 eyeOffset = vrCam.transform.position - _vrCameraOrigin.position;
+                _vrCameraOrigin.position = headBone.position - eyeOffset;
+                _vrCameraOrigin.rotation = targetRotation;
+            }
+            else
             {
-                GameObject bodyObj = targetMale.charInfo.objBodyBone;
-                if (!ReferenceEquals(bodyObj, null))
+                // --- DESKTOP / STUDIO MODE ---
+                var camCtrl = Studio.Studio.Instance.cameraCtrl;
+                if (camCtrl != null)
                 {
-                    // We use the head bone as the "Center of the Void"
-                    Vector3 headCenter = headBone.position;
-                    Renderer[] allRenderers = bodyObj.GetComponentsInChildren<Renderer>(true);
-                    for (int i = 0; i < allRenderers.Length; i++)
-                    {
-                        Renderer r = allRenderers[i];
-                        if (ReferenceEquals(r, null)) continue;
-                        string n = r.name.ToLower();
-                        // 1. Check for specific internal Japanese/Internal mesh names 
-                        // that often sit outside the normal "head" hierarchy
-                        // Check internal names (sita/shita = tongue, mayu = brow, hitomi = eye)
-                        bool isHeadMesh = n.Contains("head") || n.Contains("face") || n.Contains("hair") ||
-                                          n.Contains("eye") || n.Contains("mayu") || n.Contains("hitomi") ||
-                                          n.Contains("sclera") || n.Contains("tongue") || n.Contains("sita") ||
-                                          n.Contains("shita") || n.Contains("tooth") || n.Contains("teeth") ||
-                                          n.Contains("cf_o_tooth") || n.Contains("cf_o_tongue") ||
-                                          n.Contains("o_tang") || n.Contains("cm_o_tooth") || n.Contains("cm_o_tang");
-                        // 2. Spatial Purge: Check if the mesh is physically inside your head.
-                        // Distance 0.18f to 0.2f is the "Goldilocks Zone" to hide everything 
-                        // in the face/neck area without accidentally hiding the shoulders or chest.
-                        float dist = Vector3.Distance(r.bounds.center, headCenter);
-                        bool isTooClose = dist < 0.2f;
-                        if (isHeadMesh || isTooClose)
-                        {
-                            r.enabled = false;
-                        }
-                    }
-                    Logger.LogInfo("POV Universal Purge Complete (Spatial + Keyword).");
+                    // 1. Calculate the true rotation of the head + your custom tilt
+                    Quaternion targetRotation = headBone.rotation * Quaternion.Euler(_cameraTilt, 0, 0);
+
+                    // 2. Lock the orbit pivot exactly to the center of the head
+                    camCtrl.targetPos = headBone.position;
+
+                    // 3. Apply the rotation
+                    camCtrl.cameraAngle = targetRotation.eulerAngles;
+
+                    // 4. Force distance to 0 every single frame!
+                    // This forces the camera to stay INSIDE the pivot point (the head) instead of orbiting outside of it.
+                    SetCameraDistance(camCtrl, Vector3.zero);
                 }
             }
         }
@@ -669,32 +661,69 @@ namespace StudioCustomButton
         {
             if (targetMale == null || targetMale.charInfo == null) return;
 
+            // Clear previous list
+            _hiddenRenderers.Clear();
+
+            // 1. Standard Hide (head object)
             GameObject headObj = targetMale.charInfo.objHead;
             if (headObj != null)
             {
                 Renderer[] headRenderers = headObj.GetComponentsInChildren<Renderer>();
                 foreach (Renderer r in headRenderers)
                 {
-                    if (r != null) r.enabled = false;
+                    if (r != null && r.enabled)
+                    {
+                        _hiddenRenderers.Add(r);
+                        r.enabled = false;
+                    }
                 }
-                Logger.LogInfo("Head hidden");
+            }
+
+            // 2. Universal Spatial Purge
+            GameObject bodyObj = targetMale.charInfo.objBodyBone;
+            Transform headBone = targetMale.charInfo.objHeadBone.transform;
+
+            if (bodyObj != null && headBone != null)
+            {
+                Vector3 headCenter = headBone.position;
+                Renderer[] allRenderers = bodyObj.GetComponentsInChildren<Renderer>(true);
+                for (int i = 0; i < allRenderers.Length; i++)
+                {
+                    Renderer r = allRenderers[i];
+                    // Only track and hide things that are currently visible
+                    if (r == null || !r.enabled) continue;
+
+                    string n = r.name.ToLower();
+                    bool isHeadMesh = n.Contains("head") || n.Contains("face") || n.Contains("hair") ||
+                                      n.Contains("eye") || n.Contains("mayu") || n.Contains("hitomi") ||
+                                      n.Contains("sclera") || n.Contains("tongue") || n.Contains("sita") ||
+                                      n.Contains("shita") || n.Contains("tooth") || n.Contains("teeth") ||
+                                      n.Contains("cf_o_tooth") || n.Contains("cf_o_tongue") ||
+                                      n.Contains("o_tang") || n.Contains("cm_o_tooth") || n.Contains("cm_o_tang");
+
+                    float dist = Vector3.Distance(r.bounds.center, headCenter);
+                    bool isTooClose = dist < 0.2f;
+
+                    if (isHeadMesh || isTooClose)
+                    {
+                        _hiddenRenderers.Add(r);
+                        r.enabled = false;
+                    }
+                }
+                Logger.LogInfo("Head and accessories hidden and tracked.");
             }
         }
 
         private void ShowHead(OCIChar targetMale)
         {
-            if (targetMale == null || targetMale.charInfo == null) return;
-
-            GameObject headObj = targetMale.charInfo.objHead;
-            if (headObj != null)
+            // Restore ONLY the exact meshes we hid, leaving intentionally hidden meshes alone
+            foreach (Renderer r in _hiddenRenderers)
             {
-                Renderer[] headRenderers = headObj.GetComponentsInChildren<Renderer>();
-                foreach (Renderer r in headRenderers)
-                {
-                    if (r != null) r.enabled = true;
-                }
-                Logger.LogInfo("Head shown");
+                if (r != null) r.enabled = true;
             }
+            _hiddenRenderers.Clear();
+
+            Logger.LogInfo("Head cleanly restored.");
         }
 
         private void OnLockViewChanged(bool isOn)
@@ -797,20 +826,11 @@ namespace StudioCustomButton
             }
             else
             {
-                // Desktop mode - use Studio camera
-                Studio.CameraControl cameraCtrl = Studio.Studio.Instance.cameraCtrl;
-                if (cameraCtrl != null)
-                {
-                    Vector3 angle = cameraCtrl.cameraAngle;
-                    angle.x = _cameraTilt;
-                    cameraCtrl.cameraAngle = angle;
-                    Logger.LogInfo(string.Format("Camera tilt applied: {0}", _cameraTilt));
-                }
-                else
-                {
-                    Logger.LogWarning("Cannot apply camera tilt - Studio camera not found");
-                }
+                // Force an immediate camera update so the button works even when "Lock View" is off
+                ApplyCameraTracking();
             }
+
+            Logger.LogInfo(string.Format("Camera tilt updated to: {0}", _cameraTilt));
         }
 
         private Transform FindHeadBone(ChaControl character)
@@ -894,7 +914,7 @@ namespace StudioCustomButton
             scrollRect.movementType = ScrollRect.MovementType.Clamped;
             scrollRect.scrollSensitivity = 20f;
 
-            // Now create all controls as children of scrollContent instead of _femaleToolsMenu
+            // create all controls as children of scrollContent instead of _femaleToolsMenu
             float yPos = -20;
 
             // Back button
@@ -922,7 +942,19 @@ namespace StudioCustomButton
             yPos -= 25;
             _outfitDisplay = CreateDisplayField(scrollContent, "Outfit 0", yPos);
             yPos -= 30;
-            yPos = CreateCyclerButtons(scrollContent, "Outfit", yPos, OnOutfitPrevious, OnOutfitNext);
+
+            if (_extendedOutfitMode.Value)
+            {
+                // Extended mode: 4 buttons (+10, +1, -1, -10)
+                yPos = CreateQuadButtons(scrollContent, "Outfit", yPos,
+                    OnOutfitMinus10, OnOutfitPrevious, OnOutfitNext, OnOutfitPlus10,
+                    "-10", "-1", "+1", "+10");
+            }
+            else
+            {
+                // Normal mode: 2 buttons
+                yPos = CreateCyclerButtons(scrollContent, "Outfit", yPos, OnOutfitPrevious, OnOutfitNext);
+            }
             yPos -= 10;
 
             // Clothing State Cycler
@@ -933,7 +965,28 @@ namespace StudioCustomButton
             yPos = CreateCyclerButtons(scrollContent, "Clothing", yPos, OnClothingPrevious, OnClothingNext);
             yPos -= 15;
 
-            // SEPARATOR 1: Between Clothing and Facial Features
+            // Coordinate FOLDER Cycler
+            yPos = CreateLabel(scrollContent, "Coordinate Folder:", yPos);
+            yPos -= 25;
+            _coordFolderDisplay = CreateDisplayField(scrollContent, "Loading...", yPos);
+            yPos -= 30;
+            yPos = CreateCyclerButtons(scrollContent, "CoordFolder", yPos, OnFolderPrevious, OnFolderNext);
+            yPos -= 10;
+
+            // Coordinate CARD Cycler
+            yPos = CreateLabel(scrollContent, "Coordinate Card:", yPos);
+            yPos -= 25;
+            _clothingCardDisplay = CreateDisplayField(scrollContent, "No Card Selected", yPos);
+            yPos -= 30;
+            yPos = CreateCyclerButtons(scrollContent, "CoordinateCard", yPos, OnClothingCardPrevious, OnClothingCardNext);
+            yPos -= 10;
+
+            // Lock Hair Accessories checkbox
+            Toggle hairLockToggle;
+            yPos = CreateToggle(scrollContent, "Lock Hair Accessories", yPos, true, OnLockHairAccChanged, out hairLockToggle);
+            yPos -= 15;
+
+            // SEPARATOR
             yPos = CreateSeparator(scrollContent, yPos);
 
             // Facial Feature Cyclers
@@ -1072,25 +1125,28 @@ namespace StudioCustomButton
         {
             if (_selectedFemale == null) return;
 
-            // Sync current facial expression patterns from character
             _currentEyebrowPattern = _selectedFemale.fileStatus.eyebrowPtn;
             _currentEyePattern = _selectedFemale.fileStatus.eyesPtn;
             _currentMouthPattern = _selectedFemale.fileStatus.mouthPtn;
 
-            // Update outfit display
             if (_outfitDisplay != null)
             {
                 int currentOutfit = _selectedFemale.fileStatus.coordinateType;
                 _outfitDisplay.text = string.Format("Outfit {0}", currentOutfit);
             }
 
-            // Update facial expression displays
-            if (_eyebrowDisplay != null)
-                _eyebrowDisplay.text = string.Format("Pattern: {0}", _currentEyebrowPattern);
-            if (_eyeDisplay != null)
-                _eyeDisplay.text = string.Format("Pattern: {0}", _currentEyePattern);
-            if (_mouthDisplay != null)
-                _mouthDisplay.text = string.Format("Pattern: {0}", _currentMouthPattern);
+            byte topState = _selectedFemale.fileStatus.clothesState[0];
+            _currentClothingState = topState;
+            string[] stateNames = new string[] { "Clothed", "Partial", "Nude" };
+            if (_currentClothingState >= 0 && _currentClothingState <= 2)
+            {
+                if (_clothingDisplay != null)
+                    _clothingDisplay.text = stateNames[_currentClothingState];
+            }
+
+            if (_eyebrowDisplay != null) _eyebrowDisplay.text = string.Format("Pattern: {0}", _currentEyebrowPattern);
+            if (_eyeDisplay != null) _eyeDisplay.text = string.Format("Pattern: {0}", _currentEyePattern);
+            if (_mouthDisplay != null) _mouthDisplay.text = string.Format("Pattern: {0}", _currentMouthPattern);
         }
 
         private void OnSightPrevious()
@@ -1157,9 +1213,10 @@ namespace StudioCustomButton
             if (_selectedFemale == null) return;
             int currentOutfit = _selectedFemale.fileStatus.coordinateType;
             currentOutfit--;
-            if (currentOutfit < 0) currentOutfit = 6; // 7 outfits: 0-6
+            int maxOutfit = _extendedOutfitMode.Value ? 120 : 6;
+            if (currentOutfit < 0) currentOutfit = maxOutfit;
             _selectedFemale.ChangeCoordinateType((ChaFileDefine.CoordinateType)currentOutfit, true);
-            _selectedFemale.Reload(); // Force full reload of character
+            _selectedFemale.Reload();
             Logger.LogInfo(string.Format("Outfit changed to: {0}", currentOutfit));
 
             if (_outfitDisplay != null)
@@ -1171,11 +1228,40 @@ namespace StudioCustomButton
             if (_selectedFemale == null) return;
             int currentOutfit = _selectedFemale.fileStatus.coordinateType;
             currentOutfit++;
-            if (currentOutfit > 6) currentOutfit = 0; // 7 outfits: 0-6
+            int maxOutfit = _extendedOutfitMode.Value ? 120 : 6;
+            if (currentOutfit > maxOutfit) currentOutfit = 0;
             _selectedFemale.ChangeCoordinateType((ChaFileDefine.CoordinateType)currentOutfit, true);
-            _selectedFemale.Reload(); // Force full reload of character
+            _selectedFemale.Reload();
             Logger.LogInfo(string.Format("Outfit changed to: {0}", currentOutfit));
 
+            if (_outfitDisplay != null)
+                _outfitDisplay.text = string.Format("Outfit {0}", currentOutfit);
+        }
+
+        private void OnOutfitMinus10()
+        {
+            if (_selectedFemale == null) return;
+            int currentOutfit = _selectedFemale.fileStatus.coordinateType;
+            currentOutfit -= 10;
+            int maxOutfit = _extendedOutfitMode.Value ? 120 : 6;
+            if (currentOutfit < 0) currentOutfit = maxOutfit;
+            _selectedFemale.ChangeCoordinateType((ChaFileDefine.CoordinateType)currentOutfit, true);
+            _selectedFemale.Reload();
+            Logger.LogInfo(string.Format("Outfit changed to: {0}", currentOutfit));
+            if (_outfitDisplay != null)
+                _outfitDisplay.text = string.Format("Outfit {0}", currentOutfit);
+        }
+
+        private void OnOutfitPlus10()
+        {
+            if (_selectedFemale == null) return;
+            int currentOutfit = _selectedFemale.fileStatus.coordinateType;
+            currentOutfit += 10;
+            int maxOutfit = _extendedOutfitMode.Value ? 120 : 6;
+            if (currentOutfit > maxOutfit) currentOutfit = 0;
+            _selectedFemale.ChangeCoordinateType((ChaFileDefine.CoordinateType)currentOutfit, true);
+            _selectedFemale.Reload();
+            Logger.LogInfo(string.Format("Outfit changed to: {0}", currentOutfit));
             if (_outfitDisplay != null)
                 _outfitDisplay.text = string.Format("Outfit {0}", currentOutfit);
         }
@@ -1348,6 +1434,211 @@ namespace StudioCustomButton
             }
         }
 
+        private void ScanCoordFolders()
+        {
+            if (_coordFolders.Count > 0) return;
+            try
+            {
+                // Start from the root /coordinate folder instead of /coordinate/female
+                string rootPath = System.IO.Path.GetFullPath(System.IO.Path.Combine(Application.dataPath, "../UserData/coordinate"));
+                if (System.IO.Directory.Exists(rootPath))
+                {
+                    // Check if the root folder itself has PNGs
+                    if (System.IO.Directory.GetFiles(rootPath, "*.png", System.IO.SearchOption.TopDirectoryOnly).Length > 0)
+                    {
+                        _coordFolders.Add(rootPath);
+                    }
+
+                    // Add all subfolders that ACTUALLY contain PNG files
+                    string[] dirs = System.IO.Directory.GetDirectories(rootPath, "*", System.IO.SearchOption.AllDirectories);
+                    foreach (string d in dirs)
+                    {
+                        if (System.IO.Directory.GetFiles(d, "*.png", System.IO.SearchOption.TopDirectoryOnly).Length > 0)
+                        {
+                            _coordFolders.Add(d);
+                        }
+                    }
+
+                    _coordFolders.Sort(); // Keep folders alphabetical
+                    UpdateFolderDisplay();
+                }
+            }
+            catch (Exception ex) { Logger.LogError("Error scanning folders: " + ex.Message); }
+        }
+
+        private void UpdateFolderDisplay()
+        {
+            if (_coordFolderDisplay == null || _coordFolders.Count == 0) return;
+
+            string folderPath = _coordFolders[_currentFolderIndex];
+            string rootPath = System.IO.Path.GetFullPath(System.IO.Path.Combine(Application.dataPath, "../UserData/coordinate"));
+
+            string displayName;
+
+            // Format the name so you can see relative paths (e.g. "female/modpack")
+            if (folderPath.Equals(rootPath, StringComparison.OrdinalIgnoreCase))
+                displayName = "Root (/coordinate)";
+            else if (folderPath.StartsWith(rootPath, StringComparison.OrdinalIgnoreCase))
+                displayName = folderPath.Substring(rootPath.Length).TrimStart('\\', '/').Replace('\\', '/');
+            else
+                displayName = new System.IO.DirectoryInfo(folderPath).Name;
+
+            // Truncate from the left if it's too long so we see the folder name, not just the prefix
+            if (displayName.Length > 25) displayName = "..." + displayName.Substring(displayName.Length - 22);
+
+            _coordFolderDisplay.text = displayName;
+        }
+
+        private void OnFolderPrevious()
+        {
+            ScanCoordFolders();
+            if (_coordFolders.Count == 0) return;
+
+            _currentFolderIndex--;
+            if (_currentFolderIndex < 0) _currentFolderIndex = _coordFolders.Count - 1;
+
+            _clothingCardPaths.Clear(); // Force rescan of the new folder
+            _currentCardIndex = -1;
+
+            UpdateFolderDisplay();
+            if (_clothingCardDisplay != null) _clothingCardDisplay.text = "Folder Changed";
+        }
+
+        private void OnFolderNext()
+        {
+            ScanCoordFolders();
+            if (_coordFolders.Count == 0) return;
+
+            _currentFolderIndex++;
+            if (_currentFolderIndex >= _coordFolders.Count) _currentFolderIndex = 0;
+
+            _clothingCardPaths.Clear(); // Force rescan of the new folder
+            _currentCardIndex = -1;
+
+            UpdateFolderDisplay();
+            if (_clothingCardDisplay != null) _clothingCardDisplay.text = "Folder Changed";
+        }
+
+        private void ScanClothingCards()
+        {
+            ScanCoordFolders(); // Ensure folders are loaded
+            if (_clothingCardPaths.Count > 0 || _coordFolders.Count == 0) return;
+
+            try
+            {
+                string currentFolder = _coordFolders[_currentFolderIndex];
+
+                // ONLY scan the currently selected folder
+                if (System.IO.Directory.Exists(currentFolder))
+                {
+                    string[] files = System.IO.Directory.GetFiles(currentFolder, "*.png", System.IO.SearchOption.TopDirectoryOnly);
+                    _clothingCardPaths = new List<string>(files);
+                    _clothingCardPaths.Sort(); // Keep series in alphabetical order
+
+                    Logger.LogInfo(string.Format("Found {0} cards in {1}", _clothingCardPaths.Count, currentFolder));
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("Error scanning clothing cards: " + ex.Message);
+            }
+        }
+
+        private void OnClothingCardPrevious()
+        {
+            ScanClothingCards();
+            if (_clothingCardPaths.Count == 0)
+            {
+                if (_clothingCardDisplay != null) _clothingCardDisplay.text = "No cards in folder";
+                return;
+            }
+
+            _currentCardIndex--;
+            if (_currentCardIndex < 0) _currentCardIndex = _clothingCardPaths.Count - 1;
+
+            ApplyClothingCard();
+        }
+
+        private void OnClothingCardNext()
+        {
+            ScanClothingCards();
+            if (_clothingCardPaths.Count == 0)
+            {
+                if (_clothingCardDisplay != null) _clothingCardDisplay.text = "No cards in folder";
+                return;
+            }
+
+            _currentCardIndex++;
+            if (_currentCardIndex >= _clothingCardPaths.Count) _currentCardIndex = 0;
+
+            ApplyClothingCard();
+        }
+
+        private void ApplyClothingCard()
+        {
+            if (_selectedFemale == null || _clothingCardPaths.Count == 0) return;
+
+            // Ensure we have System.IO for this
+            string path = _clothingCardPaths[_currentCardIndex];
+            string cardName = System.IO.Path.GetFileNameWithoutExtension(path);
+
+            // Get the Studio Object Control for the character
+            OCIChar ociChar = Studio.Studio.Instance.dicObjectCtrl.Values.OfType<OCIChar>()
+                .FirstOrDefault(x => x.charInfo == _selectedFemale);
+
+            if (ociChar == null) return;
+
+            try
+            {
+                if (!_lockHairAccOnClothingChange)
+                {
+                    // ----- UNLOCKED MODE -----
+                    // Standard Studio load (this replaces clothes, hair, and accessories 
+                    // with whatever is saved on the PNG card)
+                    ociChar.LoadClothesFile(path);
+                }
+                else
+                {
+                    // ----- LOCKED MODE -----
+                    // 1. Create a temporary coordinate object to load the card data into
+                    ChaFileCoordinate tempCoord = new ChaFileCoordinate();
+                    tempCoord.LoadFile(path);
+
+                    // 2. Access the character's currently worn coordinate
+                    ChaFileCoordinate currentCoord = _selectedFemale.nowCoordinate;
+
+                    // 3. Swap the clothes data ONLY
+                    // We do NOT touch currentCoord.hair or currentCoord.accessory
+                    currentCoord.clothes = tempCoord.clothes;
+
+                    // 4. Force the 3D model to update
+                    // Arguments: Reload(bool head, bool hair, bool clothe, bool accessory)
+                    // We set head to false because we aren't changing the face shape.
+                    _selectedFemale.Reload(false, true, true, true);
+                }
+
+                // Update UI Display Text
+                if (_clothingCardDisplay != null)
+                {
+                    string displayCardName = cardName;
+                    if (displayCardName.Length > 20) displayCardName = displayCardName.Substring(0, 17) + "...";
+                    _clothingCardDisplay.text = displayCardName;
+                }
+
+                Logger.LogInfo($"Applied {cardName}. Lock Hair: {_lockHairAccOnClothingChange}");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError("Error applying clothing card: " + ex.Message);
+            }
+        }
+
+        private void OnLockHairAccChanged(bool isOn)
+        {
+            _lockHairAccOnClothingChange = isOn;
+            Logger.LogInfo("Lock Hair Acc: " + (isOn ? "ON" : "OFF"));
+        }
+
         #endregion
 
         #region Item Tools Menu
@@ -1377,11 +1668,79 @@ namespace StudioCustomButton
             yPos = CreateActionButton(_itemToolsMenu, "Spawn Camera Kit", yPos, OnSpawnCameraKit);
             yPos -= 10;
 
-            // Custom Spawn
-            yPos = CreateActionButton(_itemToolsMenu, "Spawn Custom Item #1", yPos, OnSpawnCustom1);
+            // Custom Spawn #1 (legacy - still use the old config)
+            yPos = CreateActionButton(_itemToolsMenu, "Spawn Custom #1", yPos, OnSpawnCustom1);
             yPos -= 10;
 
-            yPos = CreateLabel(_itemToolsMenu, "Configure Custom #1 in F1 Settings", yPos);
+            // Dynamic custom spawn items
+            List<CustomSpawnItem> customItems = ParseCustomSpawnItems();
+            if (customItems.Count > 0)
+            {
+                yPos = CreateSeparator(_itemToolsMenu, yPos);
+                yPos = CreateLabel(_itemToolsMenu, "Custom Items:", yPos);
+                yPos -= 5;
+
+                for (int i = 0; i < customItems.Count; i++)
+                {
+                    CustomSpawnItem item = customItems[i];
+                    int group = item.group;
+                    int cat = item.category;
+                    int itemId = item.item;
+
+                    yPos = CreateActionButton(_itemToolsMenu, "Spawn: " + item.name, yPos,
+                        () => SpawnItem(group, cat, itemId));
+                    yPos -= 5;
+                }
+            }
+
+            yPos -= 5;
+            yPos = CreateLabel(_itemToolsMenu, "Config in F1 Settings:", yPos);
+            yPos -= 15;
+            yPos = CreateLabel(_itemToolsMenu, "Custom Spawn Items List", yPos);
+            yPos -= 15;
+            yPos = CreateLabel(_itemToolsMenu, "Format: name|g|c|i;name2|...", yPos);
+        }
+
+        // Helper class for custom spawn items
+        [Serializable]
+        public class CustomSpawnItem
+        {
+            public string name;
+            public int group;
+            public int category;
+            public int item;
+        }
+
+        private List<CustomSpawnItem> ParseCustomSpawnItems()
+        {
+            List<CustomSpawnItem> items = new List<CustomSpawnItem>();
+
+            // Simple parser for format: name|group|cat|item;name2|group2|cat2|item2
+            // TODO This needs a rework so its simpler to use
+            string config = _customSpawnItems.Value;
+            if (string.IsNullOrEmpty(config)) return items;
+
+            string[] itemStrings = config.Split(';');
+            foreach (string itemString in itemStrings)
+            {
+                if (string.IsNullOrEmpty(itemString.Trim())) continue;
+
+                string[] parts = itemString.Split('|');
+                if (parts.Length == 4)
+                {
+                    CustomSpawnItem item = new CustomSpawnItem();
+                    item.name = parts[0].Trim();
+                    if (int.TryParse(parts[1].Trim(), out item.group) &&
+                        int.TryParse(parts[2].Trim(), out item.category) &&
+                        int.TryParse(parts[3].Trim(), out item.item))
+                    {
+                        items.Add(item);
+                        Logger.LogInfo(string.Format("Parsed custom item: {0} ({1}/{2}/{3})",
+                            item.name, item.group, item.category, item.item));
+                    }
+                }
+            }
+            return items;
         }
 
         private void OnDisableDynamicBones()
@@ -1789,6 +2148,87 @@ namespace StudioCustomButton
             return yPos - 35;
         }
 
+        private float CreateQuadButtons(GameObject parent, string id, float yPos,
+    UnityEngine.Events.UnityAction action1, UnityEngine.Events.UnityAction action2,
+    UnityEngine.Events.UnityAction action3, UnityEngine.Events.UnityAction action4,
+    string label1, string label2, string label3, string label4)
+        {
+            // Button 1 (-10)
+            GameObject btn1 = new GameObject("Btn1_" + id);
+            btn1.transform.SetParent(parent.transform, false);
+            Image bg1 = btn1.AddComponent<Image>();
+            bg1.color = new Color(0.3f, 0.3f, 0.3f, 1f);
+            Button button1 = btn1.AddComponent<Button>();
+            button1.onClick.AddListener(action1);
+            RectTransform rect1 = btn1.GetComponent<RectTransform>();
+            rect1.anchorMin = new Vector2(0, 1);
+            rect1.anchorMax = new Vector2(0.23f, 1);
+            rect1.pivot = new Vector2(0, 1);
+            rect1.anchoredPosition = new Vector2(10, yPos);
+            rect1.sizeDelta = new Vector2(0, 35);
+            CreateButtonText(btn1, label1);
+
+            // Button 2 (-1)
+            GameObject btn2 = new GameObject("Btn2_" + id);
+            btn2.transform.SetParent(parent.transform, false);
+            Image bg2 = btn2.AddComponent<Image>();
+            bg2.color = new Color(0.3f, 0.3f, 0.3f, 1f);
+            Button button2 = btn2.AddComponent<Button>();
+            button2.onClick.AddListener(action2);
+            RectTransform rect2 = btn2.GetComponent<RectTransform>();
+            rect2.anchorMin = new Vector2(0.26f, 1);
+            rect2.anchorMax = new Vector2(0.48f, 1);
+            rect2.pivot = new Vector2(0, 1);
+            rect2.anchoredPosition = new Vector2(0, yPos);
+            rect2.sizeDelta = new Vector2(0, 35);
+            CreateButtonText(btn2, label2);
+
+            // Button 3 (+1)
+            GameObject btn3 = new GameObject("Btn3_" + id);
+            btn3.transform.SetParent(parent.transform, false);
+            Image bg3 = btn3.AddComponent<Image>();
+            bg3.color = new Color(0.3f, 0.3f, 0.3f, 1f);
+            Button button3 = btn3.AddComponent<Button>();
+            button3.onClick.AddListener(action3);
+            RectTransform rect3 = btn3.GetComponent<RectTransform>();
+            rect3.anchorMin = new Vector2(0.52f, 1);
+            rect3.anchorMax = new Vector2(0.74f, 1);
+            rect3.pivot = new Vector2(0, 1);
+            rect3.anchoredPosition = new Vector2(0, yPos);
+            rect3.sizeDelta = new Vector2(0, 35);
+            CreateButtonText(btn3, label3);
+
+            // Button 4 (+10)
+            GameObject btn4 = new GameObject("Btn4_" + id);
+            btn4.transform.SetParent(parent.transform, false);
+            Image bg4 = btn4.AddComponent<Image>();
+            bg4.color = new Color(0.3f, 0.3f, 0.3f, 1f);
+            Button button4 = btn4.AddComponent<Button>();
+            button4.onClick.AddListener(action4);
+            RectTransform rect4 = btn4.GetComponent<RectTransform>();
+            rect4.anchorMin = new Vector2(0.77f, 1);
+            rect4.anchorMax = new Vector2(1, 1);
+            rect4.pivot = new Vector2(1, 1);
+            rect4.anchoredPosition = new Vector2(-10, yPos);
+            rect4.sizeDelta = new Vector2(0, 35);
+            CreateButtonText(btn4, label4);
+
+            return yPos - 35;
+        }
+
+        private void CreateButtonText(GameObject button, string text)
+        {
+            GameObject textObj = new GameObject("Text");
+            textObj.transform.SetParent(button.transform, false);
+            Text textComp = textObj.AddComponent<Text>();
+            textComp.text = text;
+            textComp.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            textComp.fontSize = 12;
+            textComp.alignment = TextAnchor.MiddleCenter;
+            textComp.color = Color.white;
+            SetupStretchedRectTransform(textObj.GetComponent<RectTransform>());
+        }
+
         private float CreateActionButton(GameObject parent, string label, float yPos,
             UnityEngine.Events.UnityAction action)
         {
@@ -1986,14 +2426,12 @@ namespace StudioCustomButton
 
         #endregion
 
-        void Update()
+        void LateUpdate()
         {
             // Lock view update - only run if all necessary objects exist
-            if (!_isViewLocked || !_isInitialized) return;
-            if (_selectedMale == null) return;
+            if (!_isViewLocked || !_isInitialized || _selectedMale == null) return;
 
-            // Use the same POV logic
-            ApplyPOV();
+            ApplyCameraTracking();
         }
 
         void OnDestroy()
@@ -2001,5 +2439,63 @@ namespace StudioCustomButton
             if (_mainButton != null) Destroy(_mainButton);
             if (_customPanel != null) Destroy(_customPanel);
         }
+
+        private Vector3 GetCameraDistance(Studio.CameraControl camCtrl)
+        {
+            try
+            {
+                Type type = typeof(Studio.CameraControl);
+                // Look for the hidden cameraData object
+                FieldInfo dataField = type.GetField("cameraData", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                PropertyInfo dataProp = type.GetProperty("cameraData", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                object cameraData = null;
+                if (dataField != null) cameraData = dataField.GetValue(camCtrl);
+                else if (dataProp != null) cameraData = dataProp.GetValue(camCtrl, null);
+
+                if (cameraData != null)
+                {
+                    // Extract the distance Vector3 from it
+                    FieldInfo distField = cameraData.GetType().GetField("distance", BindingFlags.Public | BindingFlags.Instance);
+                    PropertyInfo distProp = cameraData.GetType().GetProperty("distance", BindingFlags.Public | BindingFlags.Instance);
+
+                    if (distField != null) return (Vector3)distField.GetValue(cameraData);
+                    if (distProp != null) return (Vector3)distProp.GetValue(cameraData, null);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("Could not get camera distance: " + ex.Message);
+            }
+            return Vector3.zero;
+        }
+
+        private void SetCameraDistance(Studio.CameraControl camCtrl, Vector3 distance)
+        {
+            try
+            {
+                Type type = typeof(Studio.CameraControl);
+                FieldInfo dataField = type.GetField("cameraData", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                PropertyInfo dataProp = type.GetProperty("cameraData", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                object cameraData = null;
+                if (dataField != null) cameraData = dataField.GetValue(camCtrl);
+                else if (dataProp != null) cameraData = dataProp.GetValue(camCtrl, null);
+
+                if (cameraData != null)
+                {
+                    FieldInfo distField = cameraData.GetType().GetField("distance", BindingFlags.Public | BindingFlags.Instance);
+                    PropertyInfo distProp = cameraData.GetType().GetProperty("distance", BindingFlags.Public | BindingFlags.Instance);
+
+                    if (distField != null) distField.SetValue(cameraData, distance);
+                    else if (distProp != null) distProp.SetValue(cameraData, distance, null);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("Could not set camera distance: " + ex.Message);
+            }
+        }
+
     }
 }
